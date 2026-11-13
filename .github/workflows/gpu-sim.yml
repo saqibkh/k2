@@ -1,0 +1,100 @@
+name: GPU Simulator
+
+# Optional, non-required check. The hosted runners have no GPU, so this builds
+# k2's HIP port (k2/csrc and its cu_*_test gtests) for gfx90a and runs the
+# gtests on a simulated AMD Instinct MI250X
+# (https://github.com/pantheongpu/pantheonsim). The existing ROCm workflow
+# builds wheels but never runs these tests. A simulator cannot reproduce
+# hardware-specific behavior or timing, so it complements real-GPU testing and
+# does not replace it.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [ master ]
+    paths:
+      - "k2/csrc/**"
+      - "k2/CMakeLists.txt"
+      - "cmake/**"
+      - "CMakeLists.txt"
+      - ".github/workflows/gpu-sim.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  hip-tests:
+    name: HIP gtests (ROCm 7.2 and simulated MI250X)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+
+      - name: Set up the simulated GPU and ROCm
+        uses: pantheongpu/setup-pantheonsim@ab71a07326835be678918901c340d53a83358067 # v0.1.6
+        with:
+          gpu: amd/mi250x
+          cuda-toolkit: none
+          rocm: "7.2"
+
+      # The action installs only the compiler side; k2's HIP build needs
+      # hipCUB, rocPRIM, rocThrust and hipRAND.
+      - name: Install ROCm libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y comgr hsa-rocr hipcub-dev rocprim-dev \
+            rocthrust-dev hiprand-dev rocrand-dev
+
+      # libcu++ headers (<cuda/std/*>), as docs/source/installation/from_source.rst
+      # describes.
+      - name: Checkout libhipcxx
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          repository: ROCm/libhipcxx
+          ref: 2b90384c8689572436681964b92c0a1bf99e7004
+          path: libhipcxx
+          persist-credentials: false
+
+      # The gtests in k2/csrc do not use PyTorch, but the top-level CMake
+      # requires it. Build without it: drop the K2_USE_PYTORCH guard, the one
+      # torch bridge source (torch_util.cu) and the Python module. This edits
+      # the job's checkout only.
+      - name: Build without PyTorch
+        run: |
+          sed -i '/^if(NOT K2_USE_PYTORCH)$/,/^endif()$/d' CMakeLists.txt
+          sed -i '/^  torch_util\.cu$/d' k2/csrc/CMakeLists.txt
+          sed -i 's/^add_subdirectory(python)$/# &/' k2/CMakeLists.txt
+          git diff --stat
+
+      - name: Configure
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DK2_WITH_HIP=ON -DK2_WITH_CUDA=OFF \
+            -DK2_USE_PYTORCH=OFF \
+            -DCMAKE_HIP_ARCHITECTURES=gfx90a \
+            -DCMAKE_CXX_STANDARD=20 \
+            -DK2_LIBHIPCXX_INCLUDE_DIR=$GITHUB_WORKSPACE/libhipcxx/include \
+            -DK2_ENABLE_TESTS=ON \
+            -DK2_ENABLE_BENCHMARK=OFF \
+            -DK2_ENABLE_NVTX=OFF
+
+      - name: Build
+        run: cmake --build build --parallel 3
+
+      - name: Run the HIP gtests
+        run: |
+          set -o pipefail
+          vgpu run ctest --test-dir build --output-on-failure --no-tests=error \
+            -R '^Test\.Cuda\.' --timeout 3600 2>&1 | tee ctest.log
+          # default_context.cu falls back to the CPU when no device is found.
+          if grep -q 'CUDA is not available' ctest.log; then
+            echo "::error::the tests ran on the CPU fallback"; exit 1
+          fi
